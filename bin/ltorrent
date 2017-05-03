@@ -1,0 +1,750 @@
+#!/usr/bin/env python
+'''
+Written by Dmitry Chirikov <dmitry@chirikov.ru>
+This file is part of Luna, cluster provisioning tool
+https://github.com/dchirikov/luna
+
+This file is part of Luna.
+
+Luna is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+Luna is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with Luna.  If not, see <http://www.gnu.org/licenses/>.
+
+'''
+
+import luna
+import libtorrent as lt
+import os
+import sys
+import threading
+import logging
+import logging.handlers
+import datetime
+import Queue
+import pwd, grp
+import time
+import shutil
+import signal
+import atexit
+import traceback
+
+runas_user = None
+runas_group = None
+torrents_path = None
+pidfile = None
+daemonize = None
+soft_timeout = None
+hard_timeout = None
+
+try:
+    log_dir = os.environ['LUNA_LOGDIR']
+except KeyError:
+    log_dir = '/var/log/luna'
+
+flag_seed_mode = 1
+flag_override_resume_data = 2
+flag_upload_mode = 4
+flag_share_mode = 8
+flag_apply_ip_filter = 16
+flag_paused = 32
+flag_auto_managed = 64
+flag_duplicate_is_error = 128
+flag_merge_resume_trackers = 256
+flag_update_subscribe = 512
+flag_super_seeding = 1024
+flag_sequential_download = 2048
+flag_use_resume_save_path = 4096
+
+
+
+torrents = {}
+t_session = None
+
+
+#def setup_logging(debug=False):
+#    if debug:
+#        level = logging.DEBUG
+#    else:
+#        level = logging.INFO
+
+
+def get_now(shift = 0):
+    return datetime.datetime.utcnow() + datetime.timedelta(seconds = shift)
+
+class LunaTorrentFile(object):
+    def __init__(self, torrent_file = None):
+        if not bool(torrent_file):
+            logger.error("Torrent file should be specified.")
+            raise RuntimeError
+        if not os.path.exists(torrent_file):
+            logger.error("Cannot open '{}'.".format(torrent_file))
+            raise RuntimeError
+        try:
+            self.torrent_file_info = lt.torrent_info(torrent_file)
+        except:
+            logger.error("File '{}' is not a torrent file.".format(torrent_file))
+            raise RuntimeError
+        if self.torrent_file_info.creator() != luna.torrent_key:
+            logger.error("File '{}' does not belong to Luna.".format(torrent_file))
+            raise RuntimeError
+        files_present = self.torrent_file_info.num_files()
+        if files_present != 1:
+            logger.error("Torrent '{}' contains wrong numer of files: {}.".format(torrent_file, files_present))
+            raise RuntimeError
+        self._info = self.torrent_file_info
+        self._info_hash = self._info.info_hash()
+        self._path = os.path.abspath(torrent_file)
+        self._basename = os.path.basename(self._path)
+        self._tarball = self._info.orig_files().pop().path
+        self._tarball_id = self._tarball[:36]
+        self._id = self._info.comment()
+        self._active = self.update_status()
+        self._dirname = os.path.dirname(self._path)
+        if not os.path.exists(self._dirname + "/" + self._tarball):
+            logger.error("Cannot find tarball '{}' for torrent '{}'.".format(self._dirname + "/" + self._tarball, torrent_file))
+            raise RuntimeError
+        self._timestamp = get_now()
+        self._need_to_delete = False
+        self._duplicate = False
+        self._uploaded = 0
+        self._seeding = False
+
+    def __repr__(self):
+        return str({'id': self._id,
+                'tarball_id': self._tarball_id,
+                'tarball': self._tarball,
+                'info_hash': str(self._info_hash),
+                'path': self._path,
+                'basename': self._basename,
+                'info': self._info,
+                'active': self._active,
+                'need_to_delete': self._need_to_delete,
+                'accessed': self._timestamp,
+                'duplicate': self._duplicate,
+                'uploaded': self._uploaded,
+                'become_inactive': self._become_inactive,
+                'seeding': self._seeding
+            })
+    @property
+    def info_hash(self):
+        return self._info_hash
+    @property
+    def info(self):
+        return self._info
+    @property
+    def active(self):
+        return self._active
+    @active.setter
+    def active(self, flag):
+        self._active = flag
+    @property
+    def need_to_delete(self):
+        return self._need_to_delete
+    @need_to_delete.setter
+    def need_to_delete(self, flag):
+        self._need_to_delete = flag
+    @property
+    def duplicate(self):
+        return self._duplicate
+    @duplicate.setter
+    def duplicate(self, flag):
+        self._duplicate = flag
+    @property
+    def id(self):
+        return self._id
+    @property
+    def path(self):
+        return self._path
+    @property
+    def basename(self):
+        return self._basename
+    @property
+    def tarball(self):
+        return self._tarball
+    @property
+    def tarball_id(self):
+        return self._tarball_id
+    @property
+    def uploaded(self):
+        return self._uploaded
+    @uploaded.setter
+    def uploaded(self, val):
+        self._uploaded = val
+    @property
+    def become_inactive(self):
+        return self._become_inactive
+    @become_inactive.setter
+    def become_inactive(self, val):
+        self._become_inactive = val
+    @property
+    def seeding(self):
+        return self._seeding
+    @seeding.setter
+    def seeding(self, flag):
+        self._seeding = flag
+
+    def accessed(self, set_flag = False):
+        if not bool(set_flag):
+            return self._timestamp
+        self._timestamp = get_now()
+        return self._timestamp
+    def update_status(self):
+        osimages = luna.list('osimage')
+        for osimage_name in osimages:
+            osimage = luna.OsImage(osimage_name)
+            if self._id == osimage.get('torrent'):
+                self._active = True
+                self._become_inactive = None
+                return self._active
+        self._active = False
+        self._become_inactive = get_now()
+        return self._active
+
+def get_luna_torrents():
+    osimage_names = luna.list('osimage')
+    luna_torrents = {}
+    for name in osimage_names:
+        osimage = luna.OsImage(name)
+        torr_uid = str(osimage.get('torrent'))
+        osimg_name = str(osimage.name)
+        tgz_id = str(osimage.get('tarball'))
+        luna_torrents[torr_uid] = {}
+        luna_torrents[torr_uid]['name'] = osimg_name
+        luna_torrents[torr_uid]['tarball_id'] = tgz_id
+    return luna_torrents
+
+"""
+def check_path(path):
+    if not os.path.exists(path):
+        logger.error("Path '{}' does not exist.".format(path))
+        raise RuntimeError
+    if not runas_user:
+        logger.error("User needs to be configured.")
+        raise RuntimeError
+    path_stat = os.stat(path)
+    if path_stat.st_uid != user_id.pw_uid or path_stat.st_gid != user_id.pw_gid:
+        logger.error("Path is not owned by '{}:{}'".format(runas_user, runas_user))
+        raise RuntimeError
+    return path
+"""
+
+def check_path(path):
+    try:
+        user_id = pwd.getpwnam(runas_user)
+    except:
+        logger.error("No such user '{}' exists.".format(runas_user))
+        raise RuntimeError
+    if os.path.exists(path):
+        path_stat = os.stat(path)
+        if path_stat.st_uid != user_id.pw_uid or path_stat.st_gid != user_id.pw_gid:
+            logger.error("Path is not owned by '{}".format(user))
+            raise RuntimeError
+        return path
+    logger.info("Path '{}' does not exist. Creating.".format(path))
+    try:
+        os.makedirs(path)
+    except:
+        logger.error("Cannot create '{}'.".format(path))
+        raise RuntimeError
+    try:
+        os.chown(path, user_id.pw_uid, user_id.pw_gid)
+    except:
+        logger.error("Cannot chown '{}' to '{}'.".format(path, user))
+        raise RuntimeError
+    return path
+
+
+def update_torrents():
+    global torrents
+    path = torrents_path
+    if not path:
+        logger.error("Path needs to be configured")
+        raise RuntimeError
+    try:
+        path = check_path(path)
+    except:
+        logger.error("Error is occured with configured path.")
+        return None
+    files = os.listdir(path)
+    os.chdir(path)
+    torrent_files_on_disk = {}
+    for filename  in  files:
+        try:
+            file_extention = filename[-8:]
+        except:
+            logger.error("File '{}' seems not to be a torrent file".forman(filename))
+            continue
+        if not (os.path.isfile(filename) and file_extention == '.torrent'):
+            continue
+        try:
+            tf = LunaTorrentFile(filename)
+        except:
+            logger.error("Error with parsing torrent file '{}'".format(filename))
+            continue
+        #torrent_files_on_disk[tf.id] = True
+        old_tf = None
+        try:
+            old_tf = torrents[tf.id]
+        except:
+            pass
+        if bool(old_tf):
+            if str(tf.info_hash) != str(old_tf.info_hash):
+                logger.error("Was '{}' replaced? It has the same name but different info_hash.".format(filename))
+        else:
+            logger.info("New torrent file was found. '{}'".format(filename))
+            torrents[tf.id] = tf
+    find_old_torrents()
+    find_duplicates()
+    for uid in torrents:
+        if torrents[uid].duplicate == True:
+            logger.info("Duplicate torrent file '{}'".format(torrents[uid].basename))
+    return True
+
+def find_duplicates():
+    duplicates = {}
+    for file_id in torrents:
+        tf = torrents[file_id]
+        info_hash = str(tf.info_hash)
+        try:
+            duplicates[info_hash]
+        except:
+            duplicates[info_hash] = False
+            continue
+        duplicates[info_hash] = True
+    for file_id in torrents:
+        tf = torrents[file_id]
+        if tf.need_to_delete:
+            continue
+
+        if duplicates[str(tf.info_hash)] and not tf.active:
+            logger.info("Duplicate '{}' info_hash was found in '{}'.".format(str(tf.info_hash), tf.basename))
+            torrents[file_id].duplicate = True
+            continue
+        if duplicates[str(tf.info_hash)]:
+            logger.info("Duplicate info_hash '{}' was found for this active torrent '{}'.".format(info_hash, tf.basename))
+    # revert duplicate flag for one of inactive torrents
+    for uid in duplicates:
+        if not duplicates[uid]:
+            continue
+        find_dup = False
+        for file_id in torrents:
+            if find_dup:
+                continue
+            if str(torrents[file_id].info_hash) == uid:
+                logger.info("For duplicate info_hash '{}' will submit torrent '{}'.".format(info_hash, torrents[file_id].basename))
+                torrents[file_id].duplicate = False
+                find_dup = True
+
+
+def find_old_torrents():
+    global torrents
+    configured_torrents = get_luna_torrents()
+    for configured_torrent in configured_torrents:
+        try:
+            torrents[configured_torrent]
+        except:
+            logger.error("Torrent for osimage '{}' is configured but does not exist on disk.".format(configured_torrents[configured_torrent]['name']))
+    for file_id in torrents:
+        tf = torrents[file_id]
+        try:
+            configured_torrents[tf.id]
+        except:
+            if tf.active:
+                logger.error("Torrent '{}' was deleted from luna DB.".format(tf.id))
+                tf.active = False
+                tf.update_status()
+
+def start_torrent_client():
+    global t_session
+    global torrents
+    global log_dir
+    try:
+        path = check_path(torrents_path)
+    except:
+        logger.error("Error is occured with configured path.")
+        return None
+    try:
+        log_dir = check_path(log_dir)
+    except:
+        logger.error("Error is occured with log_dir.")
+        return None
+    if not bool(torrents):
+        logger.info("No torrents. Exiting.")
+        return None
+
+    os.chdir(path)
+    cluster = luna.Cluster()
+
+    ip = ''
+    try:
+        if cluster.is_ha():
+            ip = cluster.get_cluster_ips()[0]
+        else:
+            ip = cluster.get('frontend_address')
+    except:
+        logger.error(("Could not decide on ip to listen on."
+                      "Either cluster IPs or frontend address must be defined"))
+        raise RuntimeError
+
+    portmin = cluster.get('torrent_listen_port_min') or 7052
+    portmax = cluster.get('torrent_listen_port_max') or 7200
+
+    try:
+        t_session = lt.session()
+    except:
+        logger.error("Failed to open libtorrent session.")
+        raise RuntimeError
+
+    try:
+        # Set the ip parameter in announce requests; default: ip ignored
+        settings = lt.session_settings()
+        settings.announce_ip = ip
+
+        t_session.set_settings(settings)
+        t_session.listen_on(portmin, portmax, ip)
+
+    except:
+        logger.error("Failed to listen on %s using port range [%s, %s]", ip, portmin, portmax)
+        raise RuntimeError
+
+    peer_id = lt.sha1_hash('lunalunalunalunaluna')
+    t_session.set_peer_id(peer_id)
+    #t_session.flag_share_mode = True
+    #t_session.flag_seed_mode = True
+    #t_session.flag_super_seeding = 1
+    #t_session.async_add_torrent(parm_dict)
+    #t_session.resume()
+    #print torrents[0].id
+    #print t_session.is_paused()
+    #print t_session.find_torrent(torrents[0].id)
+    update_torrent_client()
+
+def update_torrent_client():
+    global t_session
+    if not bool(t_session):
+        return None
+    #cluster = luna.Cluster()
+    flags = flag_seed_mode | flag_upload_mode | flag_super_seeding
+    parm_dict = {"save_path": torrents_path, 'flags': flags }
+    for tf in torrents:
+        if torrents[tf].duplicate:
+            continue
+        if torrents[tf].need_to_delete:
+            continue
+        if torrents[tf].seeding:
+            continue
+        logger.info("Starting torrent '{}' for '{}'".format(torrents[tf].basename, torrents[tf].tarball))
+        parm_dict['ti'] = torrents[tf].info
+        t_session.async_add_torrent(parm_dict)
+        torrents[tf].seeding = True
+
+def get_lt_alerts():
+    global t_session
+    if not bool(t_session):
+        return None
+    alert = t_session.pop_alert()
+    while alert:
+        logger.info("Libtorrent alert: '{}'".format(str(alert)))
+        alert = t_session.pop_alert()
+
+def run():
+    while True:
+        remove_files()
+        get_lt_alerts()
+        update_inactive_torrents()
+        #update_torrents()
+        #update_torrent_client()
+        #for i in torrents:
+            #print torrents[i].basename, torrents[i].seeding, torrents[i].need_to_delete, '---', str(torrents[i].become_inactive), '---', str(torrents[i].accessed())
+        time.sleep(5)
+
+def update_inactive_torrents():
+    global t_session
+    if not bool(t_session):
+        return None
+    for uid in torrents:
+        tf = torrents[uid]
+        if tf.need_to_delete:
+            continue
+        if tf.duplicate:
+            continue
+        active_torr = t_session.find_torrent(tf.info_hash)
+        if tf.active:
+            if not active_torr.is_valid():
+                logger.info("Something is not right. Torrent '{}' marked as active. But not seeding. Tarball is '{}'".format(tf.basename, tf.tarball))
+            continue
+        if active_torr.status().total_upload != tf.uploaded:
+            logger.info("Torrent '{}' for '{}' still in use. '{}' bytes uploaded.".format(tf.basename, tf.tarball, active_torr.status().total_upload))
+            for i in active_torr.get_peer_info():
+                logger.info("'{}' used by '{}'".format(tf.basename, i.ip))
+            tf.uploaded = active_torr.status().total_upload
+            tf.accessed(True)
+        if tf.accessed() < get_now(-soft_timeout):
+            logger.info("Timeout for inactive torrent '{}' for '{}'. Files will be deleted.".format(tf.basename, tf.tarball))
+            tf.need_to_delete = True
+            t_session.remove_torrent(active_torr)
+            tf.seeding = False
+        if tf.become_inactive < get_now(-hard_timeout):
+            logger.info("Hard timeout for inactive torrent '{}' for '{}'. Files will be deleted.".format(tf.basename, tf.tarball))
+            tf.need_to_delete = True
+            t_session.remove_torrent(active_torr)
+            tf.seeding = False
+
+
+def remove_files():
+    def rm(path):
+        if not bool(path):
+            return None
+        try:
+            #shutil.move(path, path + ".del")
+            os.remove(path)
+        except:
+            logger.error("Cannot remove '{}'".format(path))
+    uids = torrents.keys()
+    for uid in uids:
+        tf = torrents[uid]
+        if tf.seeding:
+            continue
+        if tf.active:
+            continue
+        if tf.duplicate:
+            logger.info("Removing torrent file as duplicate '{}'".format(tf.path))
+            rm(tf.path)
+            torrents.pop(uid)
+        if tf.need_to_delete:
+            tarball_path = os.path.dirname(tf.path) + "/" + tf.tarball
+            logger.info("Removing torrent file as it marked for deletion '{}'".format(tf.path))
+            logger.info("Removing tarball file as it marked for deletion '{}'".format(tarball_path))
+            rm(tf.path)
+            rm(tarball_path)
+            torrents.pop(uid)
+
+def sighup_handler(sig, frame):
+    logger.info("Re-reading torrent files")
+    update_torrents()
+    if not bool(t_session):
+        start_torrent_client()
+    update_torrent_client()
+    #update_inactive_torrents()
+    #update_torrent_client()
+
+
+def daemonize():
+    global pidfile
+    """
+    do the UNIX double-fork magic, see Stevens' "Advanced
+    Programming in the UNIX Environment" for details (ISBN 0201563177)
+    http://www.erlenstar.demon.co.uk/unix/faq_2.html#SEC16
+    """
+    #handler = logging.handlers.SysLogHandler(address='/dev/log', facility='daemon')
+    log_handler = logging.handlers.RotatingFileHandler( log_dir + '/ltorrent.log', maxBytes = 1073741824, backupCount = 5)
+    #log_handler.doRollover()
+    logger.propagate = False
+    formatter = logging.Formatter("%(asctime)s\t%(levelname)s\t%(message)s")
+    log_handler.setFormatter(formatter)
+    logger.addHandler(log_handler)
+    stdin = '/dev/null'
+    stdout = '/dev/null'
+    stderr = '/dev/null'
+    logger.info("Starting Luna Torrent as daemon")
+    try:
+        pid = os.fork()
+        if pid > 0:
+            # exit first parent
+            sys.exit(0)
+    except OSError, e:
+        logger.error("fork #1 failed: %d (%s)\n" % (e.errno, e.strerror))
+        sys.exit(1)
+
+    # decouple from parent environment
+    os.chdir("/")
+    os.setsid()
+    os.umask(0)
+
+    # do second fork
+    try:
+        pid = os.fork()
+        if pid > 0:
+            # exit from second parent
+            sys.exit(0)
+    except OSError, e:
+        logger.error("fork #2 failed: %d (%s)\n" % (e.errno, e.strerror))
+        sys.exit(1)
+
+    # redirect standard file descriptors
+    sys.stdout.flush()
+    sys.stderr.flush()
+    si = file(stdin, 'r')
+    so = file(stdout, 'a+')
+    se = file(stderr, 'a+', 0)
+    os.dup2(si.fileno(), sys.stdin.fileno())
+    os.dup2(so.fileno(), sys.stdout.fileno())
+    os.dup2(se.fileno(), sys.stderr.fileno())
+
+    # write pidfile
+    atexit.register(exit_handler)
+    pid = str(os.getpid())
+    f = open(pidfile, "w+")
+    f.write("%s\n" % pid)
+    f.close()
+
+def start():
+    """
+    Start the daemon
+    """
+    global pidfile
+    global runas_user
+
+    logger.info("Starting Luna Torrent")
+    # Check for a pidfile to see if the daemon already runs
+    try:
+        pidfile = check_path(os.path.dirname(pidfile)) + "/" + os.path.basename(pidfile)
+        pf = file(pidfile,'r')
+        pid = int(pf.read().strip())
+        pf.close()
+    except IOError:
+        pid = None
+    user_id = pwd.getpwnam(runas_user)
+    os.setgid(user_id.pw_gid)
+    os.setuid(user_id.pw_uid)
+    if pid:
+        message = "pidfile %s already exist. Daemon already running?\n"
+        sys.stderr.write(message % pidfile)
+        sys.exit(1)
+
+    # Start the daemon
+    if daemon:
+        daemonize()
+    try:
+        update_torrents()
+        start_torrent_client()
+        run()
+    except:
+        logger.error(traceback.format_exc())
+
+def stop():
+    """
+    Stop the daemon
+    """
+    global pidfile
+    # Get the pid from the pidfile
+    logger.info("Stopping Luna Torrent")
+    try:
+        pf = file(pidfile,'r')
+        pid = int(pf.read().strip())
+        pf.close()
+    except IOError:
+        pid = None
+
+    if not pid:
+        message = "pidfile %s does not exist. Daemon not running?\n"
+        logger.error(message % pidfile)
+        return # not an error in a restart
+
+    # Try killing the daemon process
+    try:
+        while 1:
+            os.kill(pid, signal.SIGTERM)
+            time.sleep(0.1)
+    except OSError, err:
+        err = str(err)
+        if err.find("No such process") > 0:
+            if os.path.exists(pidfile):
+                os.remove(pidfile)
+        else:
+            logger.error(err)
+            sys.exit(1)
+
+def lreload():
+    """
+    Reload the daemon
+    """
+    global pidfile
+    # Get the pid from the pidfile
+    try:
+        pf = file(pidfile,'r')
+        pid = int(pf.read().strip())
+        pf.close()
+    except IOError:
+        pid = None
+
+    if not pid:
+        message = "pidfile %s does not exist. Daemon not running?\n"
+        logger.error(message % pidfile)
+        sys.exit(1)
+
+    # Try reload the daemon proces
+    try:
+        os.kill(pid, signal.SIGHUP)
+    except OSError, err:
+        err = str(err)
+        if err.find("No such process") > 0:
+            if os.path.exists(pidfile):
+                os.remove(pidfile)
+        else:
+            logger.error(err)
+            sys.exit(1)
+
+def restart():
+    """
+    Restart the daemon
+    """
+    stop()
+    start()
+
+def exit_handler():
+    global pidfile
+    os.remove(pidfile)
+
+if __name__ == '__main__':
+    logger = logging.getLogger('ltorrent')
+    signal.signal(signal.SIGHUP, sighup_handler)
+    while True:
+        try:
+            cluster = luna.Cluster()
+        except:
+            logger.error('Cannot find cluster definition in MongoDB.')
+            time.sleep(5)
+            continue
+        break
+    runas_user = cluster.get('user')
+    if not bool(runas_user):
+        runas_user = 'luna'
+    #runas_group = cluster.get('group')
+    #if not bool(runas_group):
+    #    runas_group = 'luna'
+    pidfile = cluster.get('torrent_pidfile')
+    if not bool(pidfile):
+        pidfile = '/run/luna/ltorrent.pid'
+    soft_timeout = cluster.get('torrent_soft_timeout') or 600
+    hard_timeout = cluster.get('torrent_hard_timeout') or 3600
+    torrents_path = cluster.get('path')
+    if not bool(torrents_path):
+        torrents_path = '/opt/luna'
+    torrents_path = torrents_path + "/torrents"
+    daemon = True
+    if len(sys.argv) == 2:
+        if 'start' == sys.argv[1]:
+            start()
+        elif 'stop' == sys.argv[1]:
+            stop()
+        elif 'restart' == sys.argv[1]:
+            restart()
+        elif 'reload' == sys.argv[1]:
+            lreload()
+        else:
+            logger.error("Unknown command")
+            sys.exit(2)
+        sys.exit(0)
+    else:
+            logger.error("usage: %s start|stop|restart|reload" % sys.argv[0])
+            sys.exit(2)

@@ -1,0 +1,5 @@
+pymongo==2.5.2
+python-hostlist==1.14
+tornado==2.2.1
+mock==1.0.1
+ming

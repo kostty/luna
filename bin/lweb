@@ -1,0 +1,388 @@
+#!/usr/bin/env python
+'''
+Written by Dmitry Chirikov <dmitry@chirikov.ru>
+This file is part of Luna, cluster provisioning tool
+https://github.com/dchirikov/luna
+
+This file is part of Luna.
+
+Luna is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+Luna is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with Luna.  If not, see <http://www.gnu.org/licenses/>.
+
+'''
+
+import logging
+import logging.handlers
+import sys
+import pymongo
+import signal
+import time
+import os
+import fcntl
+import pwd
+import inspect
+import atexit
+import tornado.ioloop
+import tornado.web
+import tornado.options
+import tornado.httpserver
+import tornado.process
+
+#from libtorrent import bencode
+import luna
+from luna import MacUpdater
+from luna import utils
+
+db_name = 'luna'
+try:
+    log_dir = os.environ['LUNA_LOGDIR']
+except KeyError:
+    log_dir = '/var/log/luna'
+starter_pid = None
+http_server = None
+logger = None
+pipein, pipeout = None, None
+macupdater = None
+
+
+
+def lweb_main():
+    pass
+
+
+def run_app():
+    """Start Tornado IOLoop for this application.
+    """
+    global logger
+    global pipein, pipeout
+    global starter_pid, http_server, macupdater
+
+    tornado.options.parse_command_line()
+    luna_opts = luna.Cluster()
+    port = luna_opts.get('frontend_port') or 7050
+    lweb_port = luna_opts.get('server_port') or 7051
+    server_ip = luna_opts.get('frontend_address')
+    path = luna_opts.get('path')
+    num_proc = luna_opts.get('lweb_num_proc') or 0
+    if not bool(server_ip):
+        logger.error('Server IP needs to be configured')
+        return None
+    tracker_params = {}
+    tracker_params['luna_tracker_interval'] = luna_opts.get('tracker_interval') or 30
+    tracker_params['luna_tracker_min_interval'] = luna_opts.get('tracker_min_interval') or 20
+    tracker_params['luna_tracker_maxpeers'] = luna_opts.get('tracker_maxpeers') or 200
+    manager_params = {}
+    manager_params['server_ip'] = server_ip
+    manager_params['server_port'] = port
+    manager_params['app_logger'] = logger
+    template_path = path + '/templates'
+    lweb = tornado.web.Application([
+        (r"/announce.*", luna.AnnounceHandler, dict(params=tracker_params)),
+        (r"/scrape.*", luna.ScrapeHandler, dict(params=tracker_params)),
+        (r"/luna.*", luna.Manager, dict(params=manager_params)),
+    ], template_path = template_path, xheaders=True)
+    logger.info('Starting lweb on port %d' % lweb_port)
+    try:
+        #mongo_db =  motor.motor_tornado.MotorClient()[db_name]
+        mongo_db = pymongo.MongoClient(utils.helpers.get_con_options())[db_name]
+    except:
+        logger.error("Unable to connect to MongoDB.")
+        raise RuntimeError
+    try:
+        mongo_db['tracker'].create_index("updated", expireAfterSeconds = 3600 )
+    except:
+        pass
+    macupdater = MacUpdater(mongo_db, logger = logger, interval = 30)
+    http_server = tornado.httpserver.HTTPServer(lweb)
+    http_server.bind(lweb_port, address='127.0.0.1')
+    starter_pid = os.getpid()
+
+    http_server.start(num_proc)
+    child_pid = os.getpid()
+    if starter_pid != child_pid:
+        os.close(pipein)
+        os.write(pipeout, str(child_pid) + "\n")
+    tracker_params['mongo_db'] = mongo_db
+    manager_params['mongo_db'] = mongo_db
+    tornado.ioloop.IOLoop.instance().start()
+    #tornado.ioloop.IOLoop.instance().start()
+
+def tornado_stop():
+    global http_server
+    http_server.stop()
+
+    io_loop = tornado.ioloop.IOLoop.instance()
+
+    deadline = time.time() + 3
+
+    def stop_loop():
+        now = time.time()
+        if now < deadline and (io_loop._callbacks or io_loop._timeouts):
+            io_loop.add_timeout(now + 1, stop_loop)
+        else:
+            io_loop.stop()
+    stop_loop()
+
+
+def sigterm_handler(sig, frame):
+    global pipein, starter_pid, macupdater
+
+
+    if os.getpid() == starter_pid:
+        f_pipein = os.fdopen(os.dup(pipein))
+        logger.info('Main thread. Trying to stop childs')
+        tornado_stop()
+        try:
+            for pid in f_pipein:
+                pid = int(pid[:-1])
+                logger.info("Stopping pid '{}'.".format(pid))
+                os.kill(pid, signal.SIGTERM)
+        except IOError:
+            pass
+
+        f_pipein.close()
+        macupdater.stop()
+    else:
+        tornado_stop()
+
+def check_path(path, user):
+    if not user:
+        logger.error("User needs to be configured.")
+        raise RuntimeError
+    try:
+        user_id = pwd.getpwnam(user)
+    except:
+        logger.error("No such user '{}' exists.".format(runas_user))
+        raise RuntimeError
+    if os.path.exists(path):
+        path_stat = os.stat(path)
+        if path_stat.st_uid != user_id.pw_uid or path_stat.st_gid != user_id.pw_gid:
+            logger.error("Path is not owned by '{}".format(user))
+            raise RuntimeError
+        return path
+    logger.info("Path '{}' does not exist. Creating.".format(path))
+    try:
+        os.makedirs(path)
+    except:
+        logger.error("Cannot create '{}'.".format(path))
+        raise RuntimeError
+    try:
+        os.chown(path, user_id.pw_uid, user_id.pw_gid)
+    except:
+        logger.error("Cannot chown '{}' to '{}'.".format(path, user))
+        raise RuntimeError
+    return path
+
+def daemonize():
+    global pidfile
+    """
+    do the UNIX double-fork magic, see Stevens' "Advanced
+    Programming in the UNIX Environment" for details (ISBN 0201563177)
+    http://www.erlenstar.demon.co.uk/unix/faq_2.html#SEC16
+    """
+
+    log_app_handler = logging.handlers.RotatingFileHandler( log_dir + '/lweb.log', maxBytes = 1073741824, backupCount = 5)
+    #log_app_handler.doRollover()
+    logger.propagate = False
+    formatter = logging.Formatter("%(asctime)s\t%(levelname)s\t%(message)s")
+    log_app_handler.setFormatter(formatter)
+    logger.addHandler(log_app_handler)
+    tornado.options.options['log_to_stderr'].set(False)
+    tornado.options.options['log_file_prefix'].set(log_dir + '/lweb_tornado.log')
+    tornado.options.options['log_file_max_size'].set(1073741824)
+    tornado.options.options['log_file_num_backups'].set(5)
+
+    stdin = '/dev/null'
+    stdout = '/dev/null'
+    stderr = '/dev/null'
+    logger.info("Starting lweb as daemon")
+    try:
+        pid = os.fork()
+        if pid > 0:
+            # exit first parent
+            sys.exit(0)
+    except OSError, e:
+        logger.error("fork #1 failed: %d (%s)\n" % (e.errno, e.strerror))
+        sys.exit(1)
+
+    # decouple from parent environment
+    os.chdir("/")
+    os.setsid()
+    os.umask(0)
+
+    # do second fork
+    try:
+        pid = os.fork()
+        if pid > 0:
+            # exit from second parent
+            sys.exit(0)
+    except OSError, e:
+        logger.error("fork #2 failed: %d (%s)\n" % (e.errno, e.strerror))
+        sys.exit(1)
+
+    # redirect standard file descriptors
+    sys.stdout.flush()
+    sys.stderr.flush()
+    si = file(stdin, 'r')
+    so = file(stdout, 'a+')
+    se = file(stderr, 'a+', 0)
+    os.dup2(si.fileno(), sys.stdin.fileno())
+    os.dup2(so.fileno(), sys.stdout.fileno())
+    os.dup2(se.fileno(), sys.stderr.fileno())
+
+    # write pidfile
+    #atexit.register(exit_handler)
+    pid = str(os.getpid())
+
+    logger.info("lweb pid: '{}'".format(pid))
+    logger.info("lweb pidfile: '{}'".format(pidfile))
+    f = open(pidfile, "w+")
+    f.write("%s\n" % pid)
+    f.close()
+
+
+def start():
+    """
+    Start the daemon
+    """
+    global pidfile, pipein, pipeout
+    global runas_user
+
+    logger.info("Starting lweb")
+    # Check for a pidfile to see if the daemon already runs
+    try:
+        pidfile = check_path(os.path.dirname(pidfile), runas_user) + '/' + os.path.basename(pidfile)
+        pf = file(pidfile,'r')
+        pid = int(pf.read().strip())
+        pf.close()
+    except IOError:
+        pid = None
+    user_id = pwd.getpwnam(runas_user)
+    os.setgid(user_id.pw_gid)
+    os.setuid(user_id.pw_uid)
+    if pid:
+        message = "pidfile %s already exist. Daemon already running?\n"
+        sys.stderr.write(message % pidfile)
+        sys.exit(1)
+
+    # Start the daemon
+    pipein, pipeout = os.pipe()
+    fcntl.fcntl(pipein, fcntl.F_SETFL, os.O_NONBLOCK)
+    if daemon:
+        daemonize()
+        signal.signal(signal.SIGTERM, sigterm_handler)
+        try:
+            run_app()
+        except:
+            logger.error(traceback.format_exc())
+    else:
+        try:
+            run_app()
+        except KeyboardInterrupt:
+            logger.info('Lweb Stopped.')
+            sys.exit(0)
+
+
+"""
+if __name__ == '__main__':
+
+    logger = logging.getLogger('lweb')
+
+    try:
+    except KeyboardInterrupt:
+        logger.info('Tracker Stopped.')
+        sys.exit(0)
+    except Exception as ex:
+        logger.fatal('%s' % str(ex))
+        sys.exit(-1)
+"""
+
+
+
+def stop():
+    """
+    Stop the daemon
+    """
+    global pidfile
+    # Get the pid from the pidfile
+    logger.info("Stopping lweb")
+    try:
+        pf = file(pidfile,'r')
+        pid = int(pf.read().strip())
+        pf.close()
+    except IOError:
+        pid = None
+
+    if not pid:
+        message = "pidfile %s does not exist. Daemon not running?\n"
+        logger.error(message % pidfile)
+        return # not an error in a restart
+
+    # Try killing the daemon process
+    try:
+        while 1:
+            os.kill(pid, signal.SIGTERM)
+            time.sleep(0.1)
+    except OSError, err:
+        err = str(err)
+        if err.find("No such process") > 0:
+            if os.path.exists(pidfile):
+                os.remove(pidfile)
+        else:
+            logger.error(err)
+            sys.exit(1)
+
+def restart():
+    """
+    Restart the daemon
+    """
+    stop()
+    start()
+
+if __name__ == '__main__':
+    logger = logging.getLogger('lweb')
+    tornado.options.options['log_to_stderr'].set(True)
+    while True:
+        try:
+            cluster = luna.Cluster()
+        except:
+            logger.error('Cannot find cluster definition in MongoDB.')
+            time.sleep(5)
+            continue
+        break
+    runas_user = cluster.get('user')
+    if not bool(runas_user):
+        runas_user = 'luna'
+    pidfile = cluster.get('lweb_pidfile')
+    if not bool(pidfile):
+        pidfile = '/run/luna/lweb.pid'
+    try:
+        daemon = bool(int(os.environ['LWEB_DAEMON']))
+    except KeyError:
+        daemon = True
+    if len(sys.argv) == 2:
+        if 'start' == sys.argv[1]:
+            start()
+        elif 'stop' == sys.argv[1]:
+            stop()
+        elif 'restart' == sys.argv[1]:
+            restart()
+        else:
+            logger.error("Unknown command")
+            sys.exit(2)
+        sys.exit(0)
+    else:
+        logger.error("usage: %s start|stop|restart|reload" % sys.argv[0])
+        sys.exit(2)
+
+

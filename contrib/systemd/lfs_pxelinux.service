@@ -1,0 +1,14 @@
+[Unit]
+Description=Luna FUSE filesystem for serving pxelinux config files
+After=lseb.service
+Requires=lweb.service
+
+[Service]
+Type=forking
+EnvironmentFile=/etc/sysconfig/lfs_pxelinux
+PIDFile=/var/run/luna/lfs_pxelinux.pid
+ExecStart=/usr/sbin/lfs_pxelinux start
+ExecStop=/usr/sbin/lfs_pxelinux stop
+
+[Install]
+WantedBy=multi-user.target

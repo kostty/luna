@@ -1,0 +1,11 @@
+# Environmental variable for lfs_pxelinux daemon
+
+# File to fill content of pxelinux.cfg/default
+# LFS_DEFAULT_FILE=
+
+# Pid file for daemon
+# LFS_PIDFILE=/run/luna/lfs_pxelinux.pid
+
+
+# Mountpoint
+LFS_MOUNTPOINT=/tftpboot/pxelinux.cfg
