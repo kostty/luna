@@ -32,7 +32,13 @@ from ansible.module_utils.basic import is_executable
 from ansible.module_utils._text import to_bytes
 from ansible.plugins.connection import ConnectionBase, BUFSIZE
 
-import luna
+try:
+    import luna
+except ImportError:
+    raise AnsibleError("luna is not installed")
+
+if luna.__version__ != '1.2':
+    raise AnsibleError("Only luna-1.2 is supported")
 
 try:
     from __main__ import display

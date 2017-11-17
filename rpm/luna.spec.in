@@ -120,7 +120,6 @@ SELinux policy for luna
 
 %package ansible
 Summary: Ansible support for luna
-Requires: %{name} = %{version}-%{release}
 Requires: ansible
 
 %description ansible
@@ -254,9 +253,9 @@ popd
 # ansible modules
 pushd contrib/ansible
 %{__install} -m 644 -D plugins/connection/lchroot.py            %{buildroot}%{python_sitelib}/ansible/plugins/connection/lchroot.py
-pushd utils
+pushd luna_ansible
 for f in ./*; do
-    %{__install} -m 644 -D $f                                   %{buildroot}%{python_sitelib}/luna/ansible/$f
+    %{__install} -m 644 -D $f                                   %{buildroot}%{python_sitelib}/luna_ansible/$f
 done
 popd
 pushd modules/clustering
@@ -340,8 +339,8 @@ esac
 exit 0
 
 %preun ansible
-%{_bindir}/rm -rf %{python_sitelib}/luna/ansible/*.pyc
-%{_bindir}/rm -rf %{python_sitelib}/luna/ansible/*.pyo
+%{_bindir}/rm -rf %{python_sitelib}/luna_ansible/*.pyc
+%{_bindir}/rm -rf %{python_sitelib}/luna_ansible/*.pyo
 %{_bindir}/rm -rf %{python_sitelib}/ansible/modules/clustering/*.pyc
 %{_bindir}/rm -rf %{python_sitelib}/ansible/modules/clustering/*.pyo
 %{_bindir}/rm -rf %{python_sitelib}/ansible/plugins/connection/*.pyc
@@ -443,11 +442,11 @@ exit 0
 %{_datadir}/selinux/packages/%{name}/luna.pp
 
 %files ansible
-%{python_sitelib}/luna/ansible
+%{python_sitelib}/luna_ansible
 %{python_sitelib}/ansible/modules/clustering/*.py
 %{python_sitelib}/ansible/plugins/connection/*.py
-%exclude %{python_sitelib}/luna/ansible/*.pyc
-%exclude %{python_sitelib}/luna/ansible/*.pyo
+%exclude %{python_sitelib}/luna_ansible/*.pyc
+%exclude %{python_sitelib}/luna_ansible/*.pyo
 %exclude %{python_sitelib}/ansible/modules/clustering/*.pyc
 %exclude %{python_sitelib}/ansible/modules/clustering/*.pyo
 %exclude %{python_sitelib}/ansible/plugins/connection/*.pyc

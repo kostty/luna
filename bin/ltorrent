@@ -281,7 +281,7 @@ def update_torrents():
         try:
             file_extention = filename[-8:]
         except:
-            logger.error("File '{}' seems not to be a torrent file".forman(filename))
+            logger.error("File '{}' seems not to be a torrent file".format(filename))
             continue
         if not (os.path.isfile(filename) and file_extention == '.torrent'):
             continue

@@ -1,9 +1,18 @@
 #!/usr/bin/python
 
 from ansible.module_utils.basic import AnsibleModule
-from luna.ansible.helpers import StreamStringLogger
+from ansible.errors import AnsibleError
+
+try:
+    import luna
+except ImportError:
+    raise AnsibleError("luna is not installed")
+
+from luna_ansible.helpers import StreamStringLogger
 import logging
-import luna
+
+if luna.__version__ != '1.2':
+    raise AnsibleError("Only luna-1.2 is supported")
 
 
 def luna_group_present(data):

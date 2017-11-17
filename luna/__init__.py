@@ -39,7 +39,7 @@ from mac_updater import MacUpdater
 import utils
 
 
-__version__ = '0.0.1a'
+__version__ = '1.2'
 __all__ = ['cluster', 'osimage', 'bmcsetup', 'group', 'node', 'switch',
            'network', 'tracker', 'manager', 'mac_updater', 'utils']
 __author__ = 'Dmitry Chirikov'
