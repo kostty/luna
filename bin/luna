@@ -48,7 +48,7 @@ log = logging.getLogger()
 def_format = '%20s%40s\n'
 
 
-def print_table(header, content):
+def print_table(header, content, ip_fields = None, ip_col = -1):
     for key in content:
         if key[1] is None:
             key[1] = '-'
@@ -61,22 +61,31 @@ def print_table(header, content):
         "| %-" + str(spaces + lengths[i]) + "s" for i in range(len(lengths))
     ]
 
-    #out_len = sum(lengths) + (spaces + 2) * len(lengths) + 1
     format_string = "".join(fmt_str)+"|"
 
-    separator = "+" + "+".join(["-" * (i + spaces + 1) for i in lengths]) + "+"
+    sep1 = "+" + "+".join(["-" * (i + spaces + 1) for i in lengths]) + "+"
+    if ip_fields and len(ip_fields) > 1:
+        ip_fields[-1] += spaces - 1
+        sep2 = "+"\
+             + "+".join(["-" * (i + spaces + 1) for i in lengths[:ip_col]])\
+             + "+" + "+".join(["-" * (i) for i in ip_fields]) + "+"
+        if ip_col != len(lengths)-1:
+            sep2 += "+".join(["-" * (i + spaces + 1) for i in lengths[ip_col+1:]])\
+                  + "+"
+    else:
+        sep2 = sep1
 
-    print(separator)
+    print(sep1)
 
     for i in range(len(header_array)):
         print(format_string % tuple(header_array[i]))
 
-    print(separator)
+    print(sep2)
 
     for i in range(len(content_array)):
         print(format_string % tuple(content_array[i]))
 
-    print(separator)
+    print(sep2)
 
 
 def _edit_script(old_script):
@@ -1058,40 +1067,100 @@ def _get_node_interfaces(node):
     return if_str
 
 
-def _format_node_interfaces(interfaces):
+def _format_node_interfaces(interfaces, ip_lengths = False):
 
     if_str = ''
     padding = 0
+
     for interface in interfaces:
         if len(interface) > padding:
             padding = len(interface)
 
-    for interface in interfaces:
-        first_ip = True
-        for ver in [4, 6]:
-            ip = interfaces[interface][ver]
-            if not ip:
-                continue
-            if first_ip:
-                if_str += '{:<{}}{}\n'.format(
-                    interface+":", padding+1, ip or '-')
-                first_ip = False
-            else:
-                if_str += '{:<{}}{}\n'.format(" ", padding+1, ip or '-')
-    if_str = if_str[:-1]
+    for i, interface in enumerate(interfaces):
 
+        if ip_lengths:
+             if if_str:
+                 if_str += ' | '
+             if_str += '{:<{}}'.format(interface+':', ip_lengths[i]['name']+1)
+             all_ips = filter(None, interfaces[interface].values())
+             ip_field = ' '.join(all_ips)
+             if len(all_ips) < 2:
+                 if_str += ' {:<{}}'.format(ip_field, ip_lengths[i]['max'])
+             else:
+                 if_str += ' {:<{}}'.format(interfaces[interface][4],
+                                                             ip_lengths[i][4])
+                 if_str += ' {:<{}}'.format(interfaces[interface][6],
+                                      ip_lengths[i]['max']-ip_lengths[i][4]-1)
+        else:
+            first_ip = True
+            for ver in [4, 6]:
+                ip = interfaces[interface][ver]
+                if not ip:
+                    continue
+                if first_ip:
+                    if_str += '{:<{}}{}\n'.format(interface+":", padding+1, ip)
+                    first_ip = False
+                else:
+                    if_str += '{:<{}}{}\n'.format(" ", padding+1, ip)
+    if ip_lengths:
+        for i in range(len(interfaces), len(ip_lengths)):
+            if_str += ' {:<{}}'.format('|', ip_lengths[i]['name']+
+                                                       ip_lengths[i]['max']+4)
+     
     return if_str
 
 
 def node_list(**args):
     header = ['Name', 'Group', 'MAC', 'IPs']
+    ip_column = header.index('IPs')
     content = []
     group = args['group']
+    oneline = args['one_line']
+    ip_lengths = []    
+
     if group:
       groups = [ group ]
     else:
       groups = luna.list('group')
     db = None
+
+    if oneline:
+        pending6 = []
+        for group_name in groups:
+            group = luna.Group(group_name, mongo_db=db)
+            if not db:
+                db = group._mongo_db
+            nodes = group.list_nodes()
+            sorted_keys = nodes.keys()
+            sorted_keys.sort()
+            d = len(group.list_ifs().keys()) - len(ip_lengths)
+            ip_lengths += [{'name': 0, 4: 0, 'max': 0} for i in range(d)]
+            pending6 += [ 0 for i in range(d)]
+
+            for node in sorted_keys:
+                enum_ifs = enumerate(nodes[node]['interfaces'].items())
+                for i, (ifname, ips) in enum_ifs:
+                    if ips[4]:
+                        len4 = len(ips[4])
+                    else:
+                        len4 = 0
+                    if ips[6]:
+                        len6 = len(ips[6])
+                    else:
+                        len6 = 0
+                    ip_lengths[i]['name'] = max(len(ifname),
+                                                         ip_lengths[i]['name'])
+                    ip_lengths[i][4] = max(len4, ip_lengths[i][4])
+                    if len4 and len6:
+                        pending6[i] = max(len6, pending6[i])
+                    else:
+                        ip_lengths[i]['max'] = max(len4 + len6,
+                                                          ip_lengths[i]['max'])
+        for i, lengths in enumerate(ip_lengths):
+            if pending6[i]:
+                lengths['max'] = max(pending6[i] + lengths[4] + 1, 
+                                                                lengths['max'])
+
     for group_name in groups:
         group = luna.Group(group_name, mongo_db=db)
         if not db:
@@ -1100,10 +1169,11 @@ def node_list(**args):
         sorted_keys = nodes.keys()
         sorted_keys.sort()
         for node in sorted_keys:
-            if_str = _format_node_interfaces(nodes[node]['interfaces'])
+            if_str = _format_node_interfaces(nodes[node]['interfaces'], ip_lengths)
             mac = nodes[node]['mac']
             content.append([node, '[' + group_name + ']', mac, if_str])
-    print_table(header, content)
+    ip_fields = [l['max'] + l['name'] + 4 for l in ip_lengths] 
+    print_table(header, content, ip_fields, ip_column)
     return True
 
 
@@ -1782,6 +1852,7 @@ cmd.add_argument('name', help='Name of the Group')
 # list
 cmd = node_a.add_parser('list', help='List Nodes')
 cmd.add_argument('--group', '-g',  help='List nodes from a group')
+cmd.add_argument('--one-line', '-1',  help='One line of output per node', action='store_true')
 
 # show
 cmd = node_a.add_parser('show', help='Show Node')
